@@ -1,0 +1,215 @@
+﻿# config_level2.yaml
+# Level 2: Linear Impairments Test Configuration
+
+test_name: "Level 2 - Chromatic Dispersion Benchmark"
+date_created: "2024-12-15"
+author: "Optical Simulation Team"
+
+# ============ SYSTEM PARAMETERS ============
+system:
+  # Modulation settings
+  modulation_format: "QPSK"
+  baud_rate_GHz: 32
+  samples_per_symbol: 16
+  
+  # Signal parameters
+  bits_per_symbol: 2
+  constellation_map: "gray"
+  normalization: "unity_power"
+  
+  # Pulse shaping
+  pulse_shape: "root_raised_cosine"
+  roll_off_factor: 0.25
+  filter_length: 65  # in symbols
+
+# ============ FIBER CHANNEL ============
+fiber_channel:
+  # Fiber types to test
+  fiber_types:
+    - name: "SMF-28"
+      attenuation_db_per_km: 0.2
+      dispersion_ps_nm_km: 17
+      nonlinear_coefficient: 1.3
+      
+    - name: "LEAF"
+      attenuation_db_per_km: 0.25
+      dispersion_ps_nm_km: 4
+      nonlinear_coefficient: 1.8
+  
+  # Lengths to test (in km)
+  lengths_km: [0, 20, 40, 80, 120, 160]
+  
+  # Dispersion compensation
+  dispersion_compensation:
+    enabled: true
+    method: "ideal"  # options: ideal, DCF, digital
+    residual_dispersion_ps_nm: 0
+
+# ============ SIMULATION SETTINGS ============
+simulation:
+  # Monte Carlo settings
+  monte_carlo:
+    runs_per_point: 10
+    min_errors: 100
+    max_symbols: 1000000
+    
+  # SNR settings
+  snr:
+    range_db: [6, 8, 10, 12, 14, 16]
+    points: 6
+    reference: "OSNR@0.1nm"
+    
+  # Sequence settings
+  training_sequence:
+    length_symbols: 1024
+    type: "prbs"  # pseudo-random binary sequence
+    
+  data_sequence:
+    length_symbols: [1024, 4096, 16384, 65536]
+    random_seed: 42
+
+# ============ DSP ALGORITHMS ============
+dsp_algorithms:
+  # Equalization
+  equalization:
+    type: "frequency_domain"
+    fft_size: 1024
+    overlap: 128
+    algorithm: "ZF"  # Zero Forcing
+    
+  # Synchronization
+  synchronization:
+    timing_recovery: "gardner"
+    phase_recovery: "Viterbi-Viterbi"
+    
+  # Filtering
+  filtering:
+    rx_filter: "matched"
+    bandwidth: "optimized"
+
+# ============ BENCHMARK PARAMETERS ============
+benchmark:
+  # Platforms to compare
+  platforms:
+    - name: "NumPy"
+      version: ">=1.21.0"
+      
+    - name: "JAX"
+      version: ">=0.4.0"
+      backend: "cpu"  # options: cpu, gpu, tpu
+      
+    - name: "IFTS"
+      version: "2.0"
+      license: "commercial"
+  
+  # Metrics to collect
+  metrics:
+    runtime:
+      measure: "wall_clock"
+      unit: "milliseconds"
+      precision: 3
+      
+    memory:
+      measure: "peak_usage"
+      unit: "MB"
+      
+    accuracy:
+      measures: ["BER", "Q_factor", "EVM", "SNR"]
+      tolerance: 0.1  # 10% relative error allowed
+      
+    speedup:
+      baseline: "NumPy"
+      calculation: "geometric_mean"
+
+# ============ OUTPUT SETTINGS ============
+output:
+  # File formats
+  formats:
+    - type: "json"
+      pretty_print: true
+      include_metadata: true
+      
+    - type: "csv"
+      delimiter: ","
+      include_header: true
+      
+    - type: "hdf5"
+      compression: "gzip"
+      
+  # Visualization
+  plots:
+    enabled: true
+    formats: ["png", "pdf"]
+    dpi: 150
+    style: "seaborn"
+    
+    # Plot types to generate
+    types:
+      - name: "runtime_vs_length"
+        x_axis: "fiber_length_km"
+        y_axis: "runtime_ms"
+        log_scale: "both"
+        
+      - name: "ber_vs_snr"
+        x_axis: "snr_db"
+        y_axis: "ber"
+        log_scale: "y"
+        
+      - name: "speedup_analysis"
+        type: "bar"
+        group_by: "platform"
+        
+  # Directory structure
+  directories:
+    root: "results"
+    level2: "testlevel2"
+    subdirectories: ["raw_data", "plots", "reports", "logs"]
+    
+  # Naming convention
+  naming:
+    timestamp_format: "%Y%m%d_%H%M%S"
+    filename_pattern: "level2_{platform}_{metric}_{timestamp}"
+    
+# ============ VALIDATION SETTINGS ============
+validation:
+  # Reference values (theoretical)
+  theoretical:
+    qpsk_awgn_snr_ber:
+      6: 2.39e-2
+      8: 6.34e-3
+      10: 1.27e-3
+      12: 1.91e-4
+      14: 1.78e-5
+      16: 1.11e-6
+      
+  # Acceptance criteria
+  criteria:
+    max_ber_deviation: 0.5  # dB
+    min_speedup: 1.0
+    max_memory_increase: 2.0  # times
+    
+  # Regression testing
+  regression:
+    enabled: true
+    baseline_file: "baseline_level2.json"
+    tolerance: 0.05  # 5% change allowed
+    
+# ============ HARDWARE CONFIGURATION ============
+hardware:
+  cpu:
+    model: "auto_detect"
+    cores: "all"
+    threading: true
+    
+  memory:
+    min_available: 4096  # MB
+    monitoring: true
+    
+  gpu:
+    enabled: false
+    device_id: 0
+    
+  # Performance limits
+  limits:
+    max_runtime_seconds: 3600  # 1 hour
+    max_memory_mb: 8192
