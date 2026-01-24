@@ -8,11 +8,17 @@ import scipy.signal as sp_signal
 import numpy as np
 
 # =========================================================================
-# 路径配置
+# 路径配置 (已改为相对路径)
 # =========================================================================
-FIGURE_PATH = r'C:\optical_sim_benchmark\results\figure'
+# 获取当前脚本所在目录的绝对路径
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 拼接出 results/figure 文件夹路径
+FIGURE_PATH = os.path.join(BASE_DIR, 'results', 'figure')
+
+# 递归创建目录 (makedirs 会自动创建不存在的中间层目录，如 results)
 if not os.path.exists(FIGURE_PATH):
     os.makedirs(FIGURE_PATH)
+    print(f"Created directory: {FIGURE_PATH}")
 
 # =========================================================================
 # 绘图工具函数
@@ -22,6 +28,7 @@ def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
     """生成功率谱密度图并保存"""
     plt.figure(figsize=(10, 5))
     for i in range(sig.shape[1]):
+        # 确保转为 numpy 数组以兼容 scipy
         f, Pxx_den = sp_signal.welch(np.array(sig[:, i]), fs, nperseg=1024)
         plt.semilogy(f / 1e9, Pxx_den, label=f'Pol {i}')
     plt.title(name)
@@ -30,28 +37,28 @@ def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
     plt.legend()
     plt.tight_layout()
+    # 使用通用的路径拼接
     plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
     print(f"  Saved: {filename}")
+    plt.close() # 释放内存
 
 def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
     """绘制眼图并保存"""
     plt.figure(figsize=(12, 5))
-    samples_per_eye = sps * 2
+    samples_per_eye = int(sps * 2)
     num_traces = 800
     for i in range(2):
         ax = plt.subplot(1, 2, i+1)
         start = 10000 if sig.shape[0] > 10000 else 0
-        # 确保数据长度足够
         end = min(start + num_traces * samples_per_eye, sig.shape[0])
         data = np.array(sig[start:end, i].real)
         
-        # 截取整数倍轨迹
         num_actual_traces = data.size // samples_per_eye
-        reshaped = data[:num_actual_traces * samples_per_eye].reshape(-1, samples_per_eye)
-        
-        t = np.linspace(0, 2, samples_per_eye)
-        for trace in reshaped:
-            ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
+        if num_actual_traces > 0:
+            reshaped = data[:num_actual_traces * samples_per_eye].reshape(-1, samples_per_eye)
+            t = np.linspace(0, 2, samples_per_eye)
+            for trace in reshaped:
+                ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
         
         ax.set_xlim([0, 2])
         ax.set_ylim([-amplitude_limit, amplitude_limit])
@@ -63,14 +70,13 @@ def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_
     plt.tight_layout()
     plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
     print(f"  Saved: {filename}")
+    plt.close()
 
 # =========================================================================
 # 主仿真逻辑
 # =========================================================================
 
 def main():
-    import numpy as np # 用于 welch 等兼容
-    
     # 1. Tx: 16QAM 生成
     print("Step 1: Signal Generation...")
     num_syms = 32768
@@ -152,14 +158,16 @@ def main():
         plt.axis('equal')
     plt.savefig(os.path.join(FIGURE_PATH, '03_constellations.png'), dpi=300)
     print("  Saved: 03_constellations.png")
+    plt.close()
 
     # 2. 后处理 PSD
     plot_psd(rx_aligned_all, fs=32e9, name='PSD After DSP', filename='04_psd_after_dsp.png')
     
-    # 3. 后处理眼图 (由于是 1 SPS，我们调小 limit 观察点阵开启度)
+    # 3. 后处理眼图
     plot_eye(rx_aligned_all, sps=1, name='Eye After DSP', amplitude_limit=1.5, filename='05_eye_after_dsp.png')
 
     print(f"\nAll plots are saved in: {FIGURE_PATH}")
+    # 注意：在 Colab 中 plt.show() 可选，若只需存图可注释掉
     plt.show()
 
 if __name__ == "__main__":
