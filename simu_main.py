@@ -43,23 +43,43 @@ def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
     plt.close() # 释放内存
 
 def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
-    """绘制眼图并保存"""
+    """优化后的眼图绘制逻辑：确保采样点出现在 0, 1.0, 2.0 处"""
     plt.figure(figsize=(12, 5))
-    samples_per_eye = int(sps * 2)
+    
+    # 一个眼图跨越2个符号周期，所以应包含 2*sps + 1 个点来闭合曲线
+    # 例如 sps=2, 我们取 5 个点，对应时间 [0, 0.5, 1.0, 1.5, 2.0]
+    num_points = int(2 * sps) + 1 
     num_traces = 800
+    
     for i in range(2):
         ax = plt.subplot(1, 2, i+1)
         start = 10000 if sig.shape[0] > 10000 else 0
-        end = min(start + num_traces * samples_per_eye, sig.shape[0])
-        data = np.array(sig[start:end, i].real)
         
-        num_actual_traces = data.size // samples_per_eye
-        if num_actual_traces > 0:
-            reshaped = data[:num_actual_traces * samples_per_eye].reshape(-1, samples_per_eye)
-            t = np.linspace(0, 2, samples_per_eye)
-            for trace in reshaped:
+        # 提取信号
+        data = np.array(sig[start:, i].real)
+        
+        # 核心逻辑：按步长 sps 进行滑动切割，保证每条线有 num_points 个点
+        # t=1.0 处对应的是当前的第 sps 个采样点
+        traces = []
+        for j in range(0, min(len(data) - num_points, num_traces * sps), sps):
+            trace = data[j : j + num_points]
+            traces.append(trace)
+        
+        if len(traces) > 0:
+            traces = np.array(traces)
+            # 生成横坐标：从 0 到 2，共 num_points 个刻度
+            # 这样第 sps 个点（索引从0开始）刚好在 (2 / (num_points-1)) * sps = 1.0 处
+            t = np.linspace(0, 2, num_points)
+            
+            for trace in traces:
                 ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
-        
+            
+            # 在 1.0 处画一条浅色的辅助虚线，标出决策位置
+            ax.axvline(x=1.0, color='r', linestyle='--', alpha=0.3, linewidth=1)
+            
+            # 可选：如果你想强调采样点，可以在 1.0 处点一个散点
+            # ax.scatter(np.ones(len(traces)), traces[:, sps], color='red', s=0.5, alpha=0.1)
+
         ax.set_xlim([0, 2])
         ax.set_ylim([-amplitude_limit, amplitude_limit])
         ax.set_title(f'{name} - Pol {i}')
@@ -69,7 +89,7 @@ def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_
     
     plt.tight_layout()
     plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
-    print(f"  Saved: {filename}")
+    print(f"   Saved: {filename}")
     plt.close()
 
 # =========================================================================
