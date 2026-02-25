@@ -8,96 +8,77 @@ import scipy.signal as sp_signal
 import numpy as np
 
 # =========================================================================
-# 路径配置 (已改为相对路径)
+# 1. 路径配置
 # =========================================================================
-# 获取当前脚本所在目录的绝对路径
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 拼接出 results/figure 文件夹路径
 FIGURE_PATH = os.path.join(BASE_DIR, 'results', 'figure')
-
-# 递归创建目录 (makedirs 会自动创建不存在的中间层目录，如 results)
 if not os.path.exists(FIGURE_PATH):
     os.makedirs(FIGURE_PATH)
-    print(f"Created directory: {FIGURE_PATH}")
 
 # =========================================================================
-# 绘图工具函数
+# 2. 终极对齐函数 (落实师兄建议：搜索位移 + 最小 MSE 角度)
+# =========================================================================
+
+def get_snr_ultimate(ref, rec):
+    # 归一化
+    rec = rec / (jnp.sqrt(jnp.mean(jnp.abs(rec)**2)) + 1e-12)
+    ref = ref / (jnp.sqrt(jnp.mean(jnp.abs(ref)**2)) + 1e-12)
+    
+    best_snr = -100.0
+    best_rec = rec
+    
+    # 扩大搜索范围：符号位移 (-20 到 20)
+    for shift in range(-20, 21):
+        r_shifted = jnp.roll(rec, shift)
+        
+        # 针对 16QAM 的相位模糊搜索
+        for angle_q in [0, jnp.pi/2, jnp.pi, 3*jnp.pi/2]:
+            tmp = r_shifted * jnp.exp(-1j * angle_q)
+            
+            # 解析解：直接找到使 MSE 最小的残余角度 phi
+            # 这里的 phi 补偿了师兄提到的 Constant Phase Error
+            phase_err = jnp.angle(jnp.mean(tmp * jnp.conj(ref)))
+            tmp_final = tmp * jnp.exp(-1j * phase_err)
+            
+            mse = jnp.mean(jnp.abs(ref - tmp_final)**2)
+            snr = 10 * jnp.log10(1.0 / (mse + 1e-12))
+            
+            if snr > best_snr:
+                best_snr = snr
+                best_rec = tmp_final
+                
+    return best_snr, best_rec
+
+# =========================================================================
+# 3. 绘图工具
 # =========================================================================
 
 def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
-    """生成功率谱密度图并保存"""
     plt.figure(figsize=(10, 5))
     for i in range(sig.shape[1]):
-        # 确保转为 numpy 数组以兼容 scipy
         f, Pxx_den = sp_signal.welch(np.array(sig[:, i]), fs, nperseg=1024)
         plt.semilogy(f / 1e9, Pxx_den, label=f'Pol {i}')
-    plt.title(name)
-    plt.xlabel('Frequency (GHz)')
-    plt.ylabel('PSD (V**2/Hz)')
-    plt.grid(True, which='both', linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    # 使用通用的路径拼接
-    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
-    print(f"  Saved: {filename}")
-    plt.close() # 释放内存
+    plt.title(name); plt.legend(); plt.grid(True)
+    plt.savefig(os.path.join(FIGURE_PATH, filename)); plt.close()
 
-def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
-    """优化后的眼图绘制逻辑：确保采样点出现在 0, 1.0, 2.0 处"""
+def plot_eye(sig, sps=1, name='Eye Diagram', filename='eye_diagram.png'):
     plt.figure(figsize=(12, 5))
-    
-    # 一个眼图跨越2个符号周期，所以应包含 2*sps + 1 个点来闭合曲线
-    # 例如 sps=2, 我们取 5 个点，对应时间 [0, 0.5, 1.0, 1.5, 2.0]
     num_points = int(2 * sps) + 1 
-    num_traces = 800
-    
     for i in range(2):
         ax = plt.subplot(1, 2, i+1)
-        start = 10000 if sig.shape[0] > 10000 else 0
-        
-        # 提取信号
-        data = np.array(sig[start:, i].real)
-        
-        # 核心逻辑：按步长 sps 进行滑动切割，保证每条线有 num_points 个点
-        # t=1.0 处对应的是当前的第 sps 个采样点
-        traces = []
-        for j in range(0, min(len(data) - num_points, num_traces * sps), sps):
-            trace = data[j : j + num_points]
-            traces.append(trace)
-        
-        if len(traces) > 0:
-            traces = np.array(traces)
-            # 生成横坐标：从 0 到 2，共 num_points 个刻度
-            # 这样第 sps 个点（索引从0开始）刚好在 (2 / (num_points-1)) * sps = 1.0 处
-            t = np.linspace(0, 2, num_points)
-            
-            for trace in traces:
-                ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
-            
-            # 在 1.0 处画一条浅色的辅助虚线，标出决策位置
-            ax.axvline(x=1.0, color='r', linestyle='--', alpha=0.3, linewidth=1)
-            
-            # 可选：如果你想强调采样点，可以在 1.0 处点一个散点
-            # ax.scatter(np.ones(len(traces)), traces[:, sps], color='red', s=0.5, alpha=0.1)
-
-        ax.set_xlim([0, 2])
-        ax.set_ylim([-amplitude_limit, amplitude_limit])
-        ax.set_title(f'{name} - Pol {i}')
-        ax.set_xlabel('Time (Symbol Period)')
-        ax.set_ylabel('Amplitude')
-        ax.grid(True, linestyle='--', alpha=0.5)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
-    print(f"   Saved: {filename}")
-    plt.close()
+        data = np.array(sig[-2000:, i].real)
+        for j in range(0, len(data)-num_points, sps):
+            ax.plot(np.linspace(0, 2, num_points), data[j:j+num_points], 'b-', alpha=0.03)
+        ax.axvline(x=1.0, color='r', linestyle='--', alpha=0.3)
+        ax.set_title(f'{name} - Pol {i}'); ax.set_ylim([-1.5, 1.5])
+    plt.tight_layout(); plt.savefig(os.path.join(FIGURE_PATH, filename)); plt.close()
 
 # =========================================================================
-# 主仿真逻辑
+# 4. 主仿真逻辑
 # =========================================================================
 
 def main():
-    # 1. Tx: 16QAM 生成
+    # Step 1: Tx
     print("Step 1: Signal Generation...")
     num_syms = 32768
     const = jnp.asarray(sym_map.const('16QAM', norm=True))
@@ -105,23 +86,20 @@ def main():
     tx_indices = jax.random.randint(key, (num_syms, 2), 0, 16)
     tx_syms = const[tx_indices]
 
-    # 2. Channel: 2 SPS 并加噪
-    print("Step 2: Channel Impairments...")
+    # Step 2: Channel
+    print("Step 2: Adding Noise...")
     rx_2sps = jnp.zeros((num_syms * 2, 2), dtype=tx_syms.dtype)
     rx_2sps = rx_2sps.at[::2, :].set(tx_syms) 
-    noise = (jax.random.normal(jax.random.PRNGKey(123), rx_2sps.shape) + 
-             1j * jax.random.normal(jax.random.PRNGKey(124), rx_2sps.shape)) * 0.03
+    noise = (jax.random.normal(jax.random.PRNGKey(7), rx_2sps.shape) + 
+             1j * jax.random.normal(jax.random.PRNGKey(8), rx_2sps.shape)) * 0.02
     rx_2sps += noise
 
-    # --- 绘图：DSP 前 ---
-    print("Plotting Before DSP status...")
-    plot_psd(rx_2sps, fs=64e9, name='PSD Before DSP', filename='01_psd_before_dsp.png')
-    plot_eye(rx_2sps, sps=2, name='Eye Before DSP', filename='02_eye_before_dsp.png')
-
-    # 3. Rx DSP: MIMO CMA
+    # Step 3: Rx DSP (标准 CMA)
     print("Step 3: Commplax Rx DSP...")
     taps = 41
     cma_af = af.cma(lr=1e-4, R2=1.32)
+    
+    # 使用标准初始化，不手动修改 w 以免报错
     mimo_state = cma_af.init(taps=taps, dims=2)
     rx_framed = af.frame(rx_2sps, taps=taps, sps=2)
 
@@ -131,64 +109,46 @@ def main():
 
     def scan_apply(state, inp):
         _, out = cma_af.apply(state, inp)
+        # 兼容不同版本的 commplax 输出
         sig = out[0] if isinstance(out, (tuple, list)) else out
         return state, jnp.atleast_1d(sig)
 
-    print("  Training & Applying CMA...")
+    print("   Training...")
     mimo_state, _ = jax.lax.scan(scan_train, mimo_state, rx_framed)
+    # 增加一次训练，让系数更稳
+    mimo_state, _ = jax.lax.scan(scan_train, mimo_state, rx_framed)
+    
+    print("   Applying...")
     _, rx_eq = jax.lax.scan(scan_apply, mimo_state, rx_framed)
 
-    # 4. Evaluation
-    print("Step 4: Performance Evaluation...")
+    # Step 4: 对齐与 SNR
+    print("Step 4: Ultimate Alignment (Shift + Phase)...")
     if rx_eq.ndim == 3: rx_eq = jnp.squeeze(rx_eq, axis=1)
 
-    start_idx = num_syms // 3
-    rx_final = rx_eq[start_idx:]
-    tx_final = tx_syms[start_idx:start_idx + rx_final.shape[0]]
+    # 丢弃收敛期数据
+    rx_final = rx_eq[num_syms // 2:]
+    tx_final = tx_syms[num_syms // 2 : num_syms // 2 + rx_final.shape[0]]
 
-    def get_snr(ref, rec):
-        rec = rec / (jnp.sqrt(jnp.mean(jnp.abs(rec)**2)) + 1e-12)
-        ref = ref / (jnp.sqrt(jnp.mean(jnp.abs(ref)**2)) + 1e-12)
-        best_snr, best_rec = -100.0, rec
-        for angle in [0, jnp.pi/2, jnp.pi, 3*jnp.pi/2]:
-            temp_rec = rec * jnp.exp(-1j * angle)
-            fine_angle = jnp.angle(jnp.mean(temp_rec * jnp.conj(ref)))
-            temp_rec = temp_rec * jnp.exp(-1j * fine_angle)
-            mse = jnp.mean(jnp.abs(ref - temp_rec)**2)
-            snr = 10 * jnp.log10(1.0 / (mse + 1e-12))
-            if snr > best_snr: best_snr, best_rec = snr, temp_rec
-        return best_snr, best_rec
-
-    # 处理对齐信号
     aligned_list = []
     for i in range(2):
-        snr_v, aligned_sig = get_snr(tx_final[:, i], rx_final[:, i])
-        print(f"  Pol {i} SNR: {snr_v:.2f} dB")
+        snr_v, aligned_sig = get_snr_ultimate(tx_final[:, i], rx_final[:, i])
+        print(f"   Pol {i} SNR: {snr_v:.2f} dB")
         aligned_list.append(aligned_sig)
     
     rx_aligned_all = jnp.stack(aligned_list, axis=1)
 
-    # --- 绘图：DSP 后 ---
-    # 1. 星座图
+    # Step 5: 绘图
+    print("Step 5: Final Plotting...")
     plt.figure(figsize=(10, 5))
     for i in range(2):
         plt.subplot(1, 2, i+1)
-        plt.scatter(rx_aligned_all[-3000:, i].real, rx_aligned_all[-3000:, i].imag, s=1, alpha=0.5)
-        plt.title(f'Constellation Pol {i}')
-        plt.axis('equal')
+        plt.scatter(rx_aligned_all[-2000:, i].real, rx_aligned_all[-2000:, i].imag, s=1, alpha=0.5)
+        plt.scatter(const.real, const.imag, c='red', marker='x', s=20)
+        plt.title(f'Pol {i} Constellation'); plt.axis('equal')
     plt.savefig(os.path.join(FIGURE_PATH, '03_constellations.png'), dpi=300)
-    print("  Saved: 03_constellations.png")
-    plt.close()
-
-    # 2. 后处理 PSD
-    plot_psd(rx_aligned_all, fs=32e9, name='PSD After DSP', filename='04_psd_after_dsp.png')
     
-    # 3. 后处理眼图
-    plot_eye(rx_aligned_all, sps=1, name='Eye After DSP', amplitude_limit=1.5, filename='05_eye_after_dsp.png')
-
-    print(f"\nAll plots are saved in: {FIGURE_PATH}")
-    # 注意：在 Colab 中 plt.show() 可选，若只需存图可注释掉
-    plt.show()
+    plot_eye(rx_aligned_all, sps=1, name='Eye After DSP', filename='05_eye_after_dsp.png')
+    print(f"Success! Figures saved in {FIGURE_PATH}")
 
 if __name__ == "__main__":
     main()

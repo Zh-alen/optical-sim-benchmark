@@ -1,197 +1,195 @@
 import os
-import yaml
 import jax
 import jax.numpy as jnp
-from jax import random
-import numpy as np
 import matplotlib.pyplot as plt
+from commplax import adaptive_filter as af
+from commplax import sym_map
+import scipy.signal as sp_signal
+import numpy as np
 
-# --- 根据你的清单精准导入 ---
-from commplax import util
-from commplax import filter as comm_filter    # 包含 rcosdesign
-from commplax import adaptive_filter as af    # 包含 mimo, iterate
-from commplax import sym_map                  # 包含 qammod
-from commplax import signal as sig            # 包含 delay
-from commplax.experimental import polyfit     # 备用
+# =========================================================================
+# 路径配置
+# =========================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIGURE_PATH = os.path.join(BASE_DIR, 'results', 'figure')
 
-# SSFM 和 Fiber 通常在 util 或模块内部
-# 根据清单，我们使用 dbp_params 的逆过程或手动定义 Fiber 逻辑
-# ---------------------------
+if not os.path.exists(FIGURE_PATH):
+    os.makedirs(FIGURE_PATH)
+    print(f"Created directory: {FIGURE_PATH}")
 
-def load_full_config(path='./config/paras.yml'):
-    with open(path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+# =========================================================================
+# 核心评价与自动扶正函数 (放在全局，防止 NameError)
+# =========================================================================
 
-def setup_environment(cfg):
-    device_id = str(cfg['Simu_Para'].get('device', 'cuda:0')).split(':')[-1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-    for p in [cfg['Simu_Para']['result_path'], cfg['Simu_Para']['figure_path']]:
-        os.makedirs(p, exist_ok=True)
-    print(f'--- 环境配置成功 | 设备: CUDA {device_id} ---')
-
-def main():
-    cfg = load_full_config()
-    setup_environment(cfg)
+def get_snr(ref, rec):
+    """带有自动精细相位对齐的 SNR 计算函数"""
+    # 归一化幅度
+    rec = rec / (jnp.sqrt(jnp.mean(jnp.abs(rec)**2)) + 1e-12)
+    ref = ref / (jnp.sqrt(jnp.mean(jnp.abs(ref)**2)) + 1e-12)
     
-    s_cfg, t_cfg = cfg['Simu_Para'], cfg['Tx_Para']['pulse_shaping_config']['args']
-    c_cfg, r_cfg = cfg['Ch_Para']['fiber_config'], cfg['Rx_Para']['mimo_config']
+    best_snr = -100.0
+    best_rec = rec
     
-    key = random.PRNGKey(20) 
-    
-    # 1. Tx Stage
-    print('Processing: Tx (16QAM + RRC)...')
-    num_symbols = 2**16 
-    key, subkey = random.split(key)
-    # 使用 sym_map.randqam 生成符号
-    tx_syms = sym_map.randqam(subkey, 2**s_cfg['bits_per_sym'], (num_symbols, 2))
-    
-    # 脉冲成形 (使用 filter 模块里的 rcosdesign)
-    h = comm_filter.rcosdesign(t_cfg['roll_off'], 16, t_cfg['upsam'])
-    # 手动上采样并卷积
-    tx_upsampled = jnp.zeros((tx_syms.shape[0] * t_cfg['upsam'], 2), dtype=jnp.complex64)
-    tx_upsampled = tx_upsampled.at[::t_cfg['upsam']].set(tx_syms)
-    tx_sig = jax.vmap(lambda x: jnp.convolve(x, h, mode='same'))(tx_upsampled.T).T
-    
-    tx_sig = util.normpower(tx_sig) * jnp.sqrt(10**(s_cfg['sig_power_dbm']/10)*1e-3)
-
-    # 2. Channel Stage (SSFM)
-    print('Processing: Channel (SSFM)...')
-    # 根据你的清单，利用 util.dbp_timedomain 的逆过程或自定义逻辑
-    # 为保证 100% 运行，这里使用基础 SSFM 逻辑
-    dz = 1000.0 # 1km step
-    steps = int(s_cfg['span_len'] * 1e3 / dz)
-    gamma = (2 * jnp.pi * c_cfg['n2']) / (1550e-9 * c_cfg['Aeff'] * 1e-12) / 1e3
-    beta2 = -c_cfg['D'] * (1550e-9**2) / (2 * jnp.pi * 3e8) * 1e-6
-    
-    rx_sig = tx_sig
-    for _ in range(int(s_cfg['span_num'])):
-        # 简化版 SSFM 循环
-        for __ in range(steps):
-            # 线性步
-            rx_sig = jax.vmap(lambda x: jnp.fft.ifft(jnp.fft.fft(x) * jnp.exp(-1j * beta2/2 * dz))) (rx_sig.T).T
-            # 非线性步
-            rx_sig *= jnp.exp(1j * gamma * jnp.abs(rx_sig)**2 * dz)
-        rx_sig *= jnp.exp(c_cfg['alpha_inndB']/4.343 * s_cfg['span_len'] / 2) # EDFA
-
-    # 3. Rx DSP Stage (完全替换版)
-    print('Processing: Rx DSP...')
-
-    # --- 3.1 手动色散补偿 (CDC) ---
-    def manual_cdc(signal, b2, distance, fs):
-        signal = jnp.atleast_2d(signal)
-        if signal.shape[0] < signal.shape[1]: # 确保形状是 (N, 2)
-            signal = signal.T
-        n = signal.shape[0]
-        freq = jnp.fft.fftfreq(n, d=1/float(fs))
-        omega = 2 * jnp.pi * freq
-        # 补偿公式：注意这里的距离用的是负值或者 beta2 取反来抵消传输影响
-        cdc_filter = jnp.exp(1j * 0.5 * b2 * (omega**2) * distance)
-        return jax.vmap(lambda x: jnp.fft.ifft(jnp.fft.fft(x) * cdc_filter))(signal.T).T
-
-    # 执行补偿
-    rx_sig = manual_cdc(rx_sig, beta2, float(s_cfg['total_len']) * 1e3, float(s_cfg['rx_sam_rate']))
-
-    # --- 3.2 手动重采样 (Resample to 2sps) ---
-    def simple_resample(x, up, down):
-        n = x.shape[0]
-        new_n = int(n * up / float(down))
-        t_old = jnp.arange(n)
-        t_new = jnp.linspace(0, n - 1, new_n)
-        res_x = jnp.interp(t_new, t_old, x[:, 0])
-        res_y = jnp.interp(t_new, t_old, x[:, 1])
-        return jnp.stack([res_x, res_y], axis=-1)
-
-    rx_res = simple_resample(rx_sig, 2, t_cfg['upsam'])
-    rx_res = util.normpower(rx_res)
-
-    # --- 3.3 MIMO 均衡 (最终修正版) ---
-    print("Training MIMO (CMA)...")
-    taps = 31
-    dims = 2
-    
-    # 1. 初始化对象
-    cma_obj = af.cma(lr=1e-4, R2=1.32)
-    
-    # 2. 信号预处理
-    rx_res = util.normpower(rx_res)
-    rx_framed = af.frame(rx_res, taps, sps=2) 
-
-    # 3. 权重中心初始化 (核心修复)
-    mimo_state = cma_obj.init(taps=taps, dims=dims)
-    w_shape = (dims, dims, taps)
-    center = taps // 2
-    # 创建中心抽头为 1 的矩阵
-    w_init = jnp.zeros(w_shape, dtype=jnp.complex64)
-    w_init = w_init.at[0, 0, center].set(1.0)
-    w_init = w_init.at[1, 1, center].set(1.0)
-    mimo_state = (w_init, mimo_state[1])
-
-    # 4. 执行均衡
-    indices = jnp.arange(len(rx_framed))
-    def scan_body(state, inp):
-        idx, x_f = inp
-        new_state, _ = cma_obj.update(idx, state, x_f)
-        return new_state, cma_obj.apply(new_state, x_f)
-
-    # 跑两遍：第一遍稳权重，第二遍出结果
-    mimo_state, _ = jax.lax.scan(scan_body, mimo_state, (indices, rx_framed))
-    _, rx_eq_2sps = jax.lax.scan(scan_body, mimo_state, (indices, rx_framed))
-
-    # =========================================================================
-    # --- 4.0 性能评估与符号提取 ---
-    # =========================================================================
-    print("\nEvaluating Performance...")
-    
-    # 下采样：2sps -> 1sps
-    rx_1sps = rx_eq_2sps[::2]
-    
-    # 长度对齐：确保与发送端原始符号 tx_syms 长度一致
-    n_final = min(len(rx_1sps), len(tx_syms))
-    rx_final_raw = rx_1sps[:n_final]
-    tx_final = tx_syms[:n_final]
-
-    # 初始化纠正后的信号存储
-    rx_corrected = jnp.zeros_like(rx_final_raw)
-
-    print("-" * 40)
-    for i in range(dims):
-        # 4.1 相位对齐 (盲均衡后信号通常会有相位旋转)
-        # 利用 tx_final 快速估算旋转角度并回转
-        rot = jnp.mean(tx_final[:, i] / (rx_final_raw[:, i] + 1e-12))
-        rx_corrected = rx_corrected.at[:, i].set(rx_final_raw[:, i] * rot)
+    # 1. 粗补偿：尝试 4 个 90 度对称位置
+    for angle in [0, jnp.pi/2, jnp.pi, 3*jnp.pi/2]:
+        temp_rec = rec * jnp.exp(-1j * angle)
         
-        # 4.2 计算 SNR
-        tx_final = util.normpower(tx_syms[:n_final])
-        noise = tx_final[:, i] - rx_corrected[:, i]
-        sig_p = jnp.mean(jnp.abs(tx_final[:, i])**2)
-        noi_p = jnp.mean(jnp.abs(noise)**2)
-        snr_db = 10 * jnp.log10(sig_p / noi_p)
-        print(f"Polarization {i} SNR: {snr_db:.2f} dB")
-    print("-" * 40)
+        # 2. 精补偿：利用点积均值计算残余相位偏移 (解决那 10 度的偏差)
+        phase_offset = jnp.angle(jnp.mean(temp_rec * jnp.conj(ref)))
+        temp_rec_final = temp_rec * jnp.exp(-1j * phase_offset)
+        
+        # 计算 MSE 和 SNR
+        mse = jnp.mean(jnp.abs(ref - temp_rec_final)**2)
+        snr = 10 * jnp.log10(1.0 / (mse + 1e-12))
+        
+        if snr > best_snr:
+            best_snr = snr
+            best_rec = temp_rec_final
+            
+    return best_snr, best_rec
 
-    # =========================================================================
-    # --- 5.0 结果可视化 ---
-    # =========================================================================
-    print(f"Simulation completed! Saving constellation to: {s_cfg['figure_path']}")
-    
+# =========================================================================
+# 绘图工具函数
+# =========================================================================
+
+def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
+    plt.figure(figsize=(10, 5))
+    for i in range(sig.shape[1]):
+        f, Pxx_den = sp_signal.welch(np.array(sig[:, i]), fs, nperseg=1024)
+        plt.semilogy(f / 1e9, Pxx_den, label=f'Pol {i}')
+    plt.title(name)
+    plt.xlabel('Frequency (GHz)')
+    plt.ylabel('PSD (V**2/Hz)')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
+    print(f"   Saved: {filename}")
+    plt.close()
+
+def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
+    """优化后的眼图绘制：在 1.0 处有精确采样点"""
     plt.figure(figsize=(12, 5))
+    num_points = int(2 * sps) + 1 
+    num_traces = 800
     
-    # 绘制第一个偏振态的星座图
-    plt.subplot(1, 2, 1)
-    plt.scatter(rx_corrected[-2000:, 0].real, rx_corrected[-2000:, 0].imag, s=1, alpha=0.5)
-    plt.title(f"Pol-X (SNR: {snr_db:.2f} dB)")
-    plt.grid(True)
-    
-    # 绘制第二个偏振态的星座图
-    plt.subplot(1, 2, 2)
-    plt.scatter(rx_corrected[-2000:, 1].real, rx_corrected[-2000:, 1].imag, s=1, alpha=0.5, color='orange')
-    plt.title(f"Pol-Y")
-    plt.grid(True)
+    for i in range(2):
+        ax = plt.subplot(1, 2, i+1)
+        start = 10000 if sig.shape[0] > 10000 else 0
+        data = np.array(sig[start:, i].real)
+        
+        traces = []
+        for j in range(0, min(len(data) - num_points, num_traces * sps), sps):
+            trace = data[j : j + num_points]
+            traces.append(trace)
+        
+        if len(traces) > 0:
+            traces = np.array(traces)
+            t = np.linspace(0, 2, num_points)
+            for trace in traces:
+                ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
+            
+            # 标注决策时刻
+            ax.axvline(x=1.0, color='r', linestyle='--', alpha=0.3, linewidth=1)
+
+        ax.set_xlim([0, 2])
+        ax.set_ylim([-amplitude_limit, amplitude_limit])
+        ax.set_title(f'{name} - Pol {i}')
+        ax.set_xlabel('Time (Symbol Period)')
+        ax.set_ylabel('Amplitude')
+        ax.grid(True, linestyle='--', alpha=0.5)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(s_cfg['figure_path'], "res.png"))
+    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
+    print(f"   Saved: {filename}")
+    plt.close()
+
+# =========================================================================
+# 主仿真逻辑
+# =========================================================================
+
+def main():
+    # 1. Tx: 16QAM 生成
+    print("Step 1: Signal Generation...")
+    num_syms = 32768
+    const = jnp.asarray(sym_map.const('16QAM', norm=True))
+    key = jax.random.PRNGKey(42)
+    tx_indices = jax.random.randint(key, (num_syms, 2), 0, 16)
+    tx_syms = const[tx_indices]
+
+    # 2. Channel: 2 SPS 并加噪
+    print("Step 2: Channel Impairments...")
+    rx_2sps = jnp.zeros((num_syms * 2, 2), dtype=tx_syms.dtype)
+    rx_2sps = rx_2sps.at[::2, :].set(tx_syms) 
+    noise = (jax.random.normal(jax.random.PRNGKey(123), rx_2sps.shape) + 
+             1j * jax.random.normal(jax.random.PRNGKey(124), rx_2sps.shape)) * 0.03
+    rx_2sps += noise
+
+    # --- 绘图：DSP 前 ---
+    print("Plotting Before DSP status...")
+    plot_psd(rx_2sps, fs=64e9, name='PSD Before DSP', filename='01_psd_before_dsp.png')
+    plot_eye(rx_2sps, sps=2, name='Eye Before DSP', filename='02_eye_before_dsp.png')
+
+    # 3. Rx DSP: MIMO CMA
+    print("Step 3: Commplax Rx DSP...")
+    taps = 41
+    cma_af = af.cma(lr=1e-4, R2=1.32)
+    mimo_state = cma_af.init(taps=taps, dims=2)
+    rx_framed = af.frame(rx_2sps, taps=taps, sps=2)
+
+    def scan_train(state, inp):
+        new_state, _ = cma_af.update(0, state, inp)
+        return new_state, None
+
+    def scan_apply(state, inp):
+        _, out = cma_af.apply(state, inp)
+        sig = out[0] if isinstance(out, (tuple, list)) else out
+        return state, jnp.atleast_1d(sig)
+
+    print("   Training & Applying CMA...")
+    mimo_state, _ = jax.lax.scan(scan_train, mimo_state, rx_framed)
+    _, rx_eq = jax.lax.scan(scan_apply, mimo_state, rx_framed)
+
+    # 4. Evaluation
+    print("Step 4: Performance Evaluation...")
+    if rx_eq.ndim == 3: rx_eq = jnp.squeeze(rx_eq, axis=1)
+
+    start_idx = num_syms // 3
+    rx_final = rx_eq[start_idx:]
+    tx_final = tx_syms[start_idx:start_idx + rx_final.shape[0]]
+
+    # 处理对齐信号 (集成自动扶正)
+    aligned_list = []
+    for i in range(2):
+        snr_v, aligned_sig = get_snr(tx_final[:, i], rx_final[:, i])
+        print(f"   Pol {i} SNR: {snr_v:.2f} dB")
+        aligned_list.append(aligned_sig)
+    
+    rx_aligned_all = jnp.stack(aligned_list, axis=1)
+
+    # --- 绘图：DSP 后 ---
+    # 1. 星座图
+    plt.figure(figsize=(10, 5))
+    for i in range(2):
+        ax = plt.subplot(1, 2, i+1)
+        plt.scatter(rx_aligned_all[-3000:, i].real, rx_aligned_all[-3000:, i].imag, s=1, alpha=0.5)
+        plt.title(f'Constellation Pol {i}')
+        plt.axis('equal')
+        # 画出理想星座点参考
+        plt.scatter(const.real, const.imag, c='red', marker='x', s=20, alpha=0.7)
+        
+    plt.savefig(os.path.join(FIGURE_PATH, '03_constellations.png'), dpi=300)
+    print("   Saved: 03_constellations.png")
+    plt.close()
+
+    # 2. 后处理 PSD
+    plot_psd(rx_aligned_all, fs=32e9, name='PSD After DSP', filename='04_psd_after_dsp.png')
+    
+    # 3. 后处理眼图 (sps=1 因为均衡后已提取出符号)
+    plot_eye(rx_aligned_all, sps=1, name='Eye After DSP', amplitude_limit=1.5, filename='05_eye_after_dsp.png')
+
+    print(f"\nAll plots are saved in: {FIGURE_PATH}")
     plt.show()
 
-# 执行
 if __name__ == "__main__":
     main()
