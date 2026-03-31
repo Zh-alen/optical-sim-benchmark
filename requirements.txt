@@ -1,4 +1,15 @@
-# requirements.txt 
-numpy 
-scipy 
-matplotlib 
+
+# 基础运行平台
+marimo
+
+# 数学计算与 DSP 核心
+jax
+jaxlib
+numpy
+scipy
+
+# 可视化
+matplotlib
+
+# 你的光通信算法库
+commplax

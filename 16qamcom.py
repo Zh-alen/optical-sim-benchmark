@@ -1,4 +1,5 @@
 import os
+import time  # 【新增】：导入时间模块
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ if not os.path.exists(FIGURE_PATH):
     os.makedirs(FIGURE_PATH)
 
 # =========================================================================
-# 核心评价与绘图函数
+# 核心评价与智能绘图函数 (包含理论基准线 & 10^-14 锁定)
 # =========================================================================
 def get_snr(ref, rec):
     rec = rec / (jnp.sqrt(jnp.mean(jnp.abs(rec)**2)) + 1e-12)
@@ -40,6 +41,58 @@ def get_snr(ref, rec):
                 best_snr = snr
                 best_rec = temp_rec_final
     return best_snr, best_rec
+
+def plot_psd(sig, fs, baud_rate, beta, noise_var, name='Signal PSD', filename='psd_analysis.png'):
+    """自动适配 2 SPS (滚降) 和 1 SPS (混叠平坦) 的智能 PSD 绘图函数"""
+    plt.figure(figsize=(10, 5))
+    
+    for i in range(sig.shape[1]):
+        f, Pxx_den = sp_signal.welch(np.array(sig[:, i]), fs, nperseg=1024, return_onesided=False)
+        f = np.fft.fftshift(f)
+        Pxx_den = np.fft.fftshift(Pxx_den)
+        plt.semilogy(f / 1e9, Pxx_den, alpha=0.7, label=f'Simulated Pol {i}')
+        
+    f_theo = np.linspace(-fs/2, fs/2, 2048)
+    Ts = 1.0 / baud_rate
+    f_abs = np.abs(f_theo)
+    psd_theo = np.zeros_like(f_theo)
+    
+    if np.isclose(fs, baud_rate * 2):
+        # 2 SPS 场景：绘制 RRC 滚降
+        f1 = (1.0 - beta) / (2.0 * Ts)
+        f2 = (1.0 + beta) / (2.0 * Ts)
+        
+        idx_pass = f_abs <= f1
+        psd_theo[idx_pass] = Ts
+        idx_trans = (f_abs > f1) & (f_abs <= f2)
+        psd_theo[idx_trans] = (Ts / 2.0) * (1.0 + np.cos((np.pi * Ts / beta) * (f_abs[idx_trans] - f1)))
+        
+        P_avg = 0.5 
+        noise_psd = noise_var / fs
+        psd_theo = (psd_theo * P_avg) + noise_psd
+        label_theo = 'Theoretical RRC + AWGN Floor'
+        
+    elif np.isclose(fs, baud_rate):
+        # 1 SPS 场景：频谱混叠平坦
+        psd_theo[:] = 1.0 / baud_rate
+        label_theo = 'Theoretical Flat Spectrum (1 SPS Aliased)'
+    else:
+        psd_theo[:] = np.nan
+        label_theo = 'Unknown SPS'
+        
+    if not np.isnan(psd_theo).all():
+        plt.semilogy(f_theo / 1e9, psd_theo, 'k--', linewidth=2, label=label_theo)
+    
+    plt.title(name)
+    plt.xlabel('Frequency (GHz)')
+    plt.ylabel('Power Spectral Density (V^2/Hz)')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.legend()
+    # 强制将所有 PSD 图的视角下限锁死在 1e-14
+    plt.ylim(bottom=1e-14, top=1e-9) 
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
+    plt.close()
 
 def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
     plt.figure(figsize=(12, 5))
@@ -88,40 +141,42 @@ def get_safe_rrc_taps(sps, num_taps, beta=0.1):
         if val == 0.0:
             h[i] = 1.0 - beta + (4 * beta / np.pi)
         elif np.abs(np.abs(val) - 1.0 / (4 * beta)) < 1e-6:
-            h[i] = (beta / np.sqrt(2)) * ((1 + 2 / np.pi) * np.sin(np.pi / (4 * beta)) + 
-                                          (1 - 2 / np.pi) * np.cos(np.pi / (4 * beta)))
+            h[i] = (beta / jnp.sqrt(2)) * ((1 + 2 / np.pi) * jnp.sin(np.pi / (4 * beta)) + 
+                                          (1 - 2 / np.pi) * jnp.cos(np.pi / (4 * beta)))
         else:
-            num = np.sin(np.pi * val * (1 - beta)) + 4 * beta * val * np.cos(np.pi * val * (1 + beta))
+            num = jnp.sin(np.pi * val * (1 - beta)) + 4 * beta * val * jnp.cos(np.pi * val * (1 + beta))
             den = np.pi * val * (1 - (4 * beta * val)**2)
             h[i] = num / den
-    return h / np.sqrt(np.sum(h**2))
+    return h / jnp.sqrt(jnp.sum(h**2))
 
 # =========================================================================
 # 主仿真逻辑
 # =========================================================================
 def main():
+    # 【新增】：记录程序开始时间
+    start_time = time.time()
+
     print("Step 1: Signal Generation & Pulse Shaping...")
     num_syms = 32768
     baud_rate = 32e9 
+    beta = 0.1 # 明确提取出 beta，供画图使用
     const = jnp.asarray(sym_map.const('16QAM', norm=True))
     key = jax.random.PRNGKey(42)
     tx_indices = jax.random.randint(key, (num_syms, 2), 0, 16)
     tx_syms = const[tx_indices]
 
     rrc_taps_len = 65
-    h_rrc = get_safe_rrc_taps(sps=2, num_taps=rrc_taps_len, beta=0.1)
+    h_rrc = get_safe_rrc_taps(sps=2, num_taps=rrc_taps_len, beta=beta)
     tx_sig = sp_signal.upfirdn(h_rrc, np.array(tx_syms), up=2, axis=0)
     delay = (rrc_taps_len - 1) // 2
     rx_2sps = jnp.array(tx_sig[delay : delay + num_syms * 2])
 
     print("Step 2: Realistic Channel Impairments...")
-    # 偏振旋转
     theta = jnp.pi / 4 * 0.6
     J_rot = jnp.array([[jnp.cos(theta), jnp.sin(theta)],
                        [-jnp.sin(theta), jnp.cos(theta)]])
     rx_2sps = rx_2sps @ J_rot.T
     
-    # 激光器相位噪声 (降低到 10kHz 标准水平测试锁相环)
     lw = 10e3  
     Ts = 1.0 / (baud_rate * 2)
     sigma = jnp.sqrt(2 * jnp.pi * lw * Ts)
@@ -130,24 +185,35 @@ def main():
     
     rx_2sps = apply_chromatic_dispersion(rx_2sps, baud_rate, sps=2, D=17.0, L=80.0)
 
-    # AWGN 噪声
+    # 精确计算噪声功率
+    noise_amp = 0.04
+    noise_var = 2 * (noise_amp**2)
     noise = (jax.random.normal(jax.random.PRNGKey(123), rx_2sps.shape) + 
-             1j * jax.random.normal(jax.random.PRNGKey(124), rx_2sps.shape)) * 0.04
+             1j * jax.random.normal(jax.random.PRNGKey(124), rx_2sps.shape)) * noise_amp
     rx_2sps += noise
+
+    print("Generating [2], [4]: Pre-DSP Plots...")
+    # [2] 01_psd_before_dsp.png
+    plot_psd(rx_2sps, fs=baud_rate*2, baud_rate=baud_rate, beta=beta, noise_var=noise_var, 
+             name='PSD Before DSP (2 SPS)', filename='01_psd_before_dsp.png')
+    # [4] 02_eye_before_dsp.png
+    plot_eye(rx_2sps, sps=2, name='16QAM Eye Before DSP', filename='02_eye_before_dsp.png')
 
     print("Step 2.5: Static CDC & Rx Matched Filtering...")
     rx_2sps = apply_chromatic_dispersion(rx_2sps, baud_rate, sps=2, D=17.0, L=-80.0)
     rx_mf = sp_signal.upfirdn(h_rrc, np.array(rx_2sps), up=1, axis=0)
     rx_2sps = jnp.array(rx_mf[delay : delay + num_syms * 2])
     
+    print("Generating [3]: Post-CDC Eye Diagram...")
+    # [3] 02.5_eye_after_cdc_mf.png
+    plot_eye(rx_2sps, sps=2, name='16QAM Eye After CDC & MF', filename='02.5_eye_after_cdc_mf.png')
 
     print("Step 3: Downsample to 1 SPS & Commplax Rx DSP (MIMOCell + CMA)...")
     rx_1sps = rx_2sps[::2] 
     rx_1sps = rx_1sps / jnp.sqrt(jnp.mean(jnp.abs(rx_1sps)**2, axis=0))
 
-    # 抽头数降至 3，仅用于 1 SPS 信号的偏振追踪，拒绝过拟合！
     taps = 3
-    kernel = ak.cma(lr=2e-3, R2=1.32) # 抽头少，学习率可以大胆提高
+    kernel = ak.cma(lr=2e-3, R2=1.32) 
     cma_eq = MIMOCell(num_taps=taps, dims=2, kernel=kernel, up=1, down=1)
 
     def scan_step(eq_state, x):
@@ -185,12 +251,10 @@ def main():
     
     rx_aligned_all = jnp.stack(aligned_list, axis=1)
 
-    # =========================================================================
-    # 生成诊断图
-    # =========================================================================
-    print("Generating Diagnostic Plots...")
+    print("Generating [1], [5], [6], [7]: Final Output Plots...")
+    
+    # [1] 00_diagnostic_plot.png
     plt.figure(figsize=(15, 5))
-
     ax1 = plt.subplot(1, 3, 1)
     ax1.scatter(rx_eq_cut[-4000:, 0].real, rx_eq_cut[-4000:, 0].imag, s=1, alpha=0.5, color='tab:blue')
     ax1.set_title("1. After CMA (Before CPR)")
@@ -212,21 +276,46 @@ def main():
     ax3.grid(True, linestyle=':', alpha=0.6)
 
     plt.tight_layout()
-    diagnostic_path = os.path.join(FIGURE_PATH, '00_diagnostic_plot.png')
-    plt.savefig(diagnostic_path, dpi=300)
+    plt.savefig(os.path.join(FIGURE_PATH, '00_diagnostic_plot.png'), dpi=300)
     plt.close()
     
+    # [5] 03_constellations.png
+    plt.figure(figsize=(10, 5))
+    for i in range(2):
+        ax = plt.subplot(1, 2, i+1)
+        plt.scatter(rx_aligned_all[-4000:, i].real, rx_aligned_all[-4000:, i].imag, s=1, alpha=0.5)
+        plt.title(f'Constellation Pol {i}\nSNR: {float(snr_vals[i]):.2f} dB')
+        plt.axis('equal')
+        plt.scatter(const.real, const.imag, c='red', marker='x', s=20, alpha=0.7)
+        
+    plt.savefig(os.path.join(FIGURE_PATH, '03_constellations.png'), dpi=300)
+    plt.close()
+
+    # [6] 04_psd_after_dsp.png (1 SPS Aliased)
+    plot_psd(rx_aligned_all, fs=baud_rate, baud_rate=baud_rate, beta=beta, noise_var=noise_var, 
+             name='PSD After DSP (1 SPS Aliased)', filename='04_psd_after_dsp.png')
+             
+    # [7] 05_eye_after_dsp.png (1 SPS)
+    plot_eye(rx_aligned_all, sps=1, name='Eye After DSP (Recovered)', amplitude_limit=1.5, filename='05_eye_after_dsp.png')
+
+    # =========================================================================
+    # 【新增】：计算总耗时并优雅地打印输出面板
+    # =========================================================================
+    end_time = time.time()
+    total_time = end_time - start_time
     
-    print("\n" + "="*50)
-    print(f"仿真结束，所有图像已保存至目录:\n{FIGURE_PATH}\n")
+    print("\n" + "="*55)
+    print(f"仿真完美结束！")
+    print(f"总共耗时: {total_time:.2f} 秒")
+    print(f"图像已保存至目录:\n   {FIGURE_PATH}\n")
     print("本次生成的图像文件清单:")
     
     # 动态读取并打印文件夹下的所有 .png 文件
-    saved_files = [f for f in os.listdir(FIGURE_PATH) if f.endswith('.png')]
-    for idx, file_name in enumerate(sorted(saved_files), 1):
-        print(f"  [{idx}] {file_name}")
-        
-    print("="*50 + "\n")
+    if os.path.exists(FIGURE_PATH):
+        saved_files = [f for f in os.listdir(FIGURE_PATH) if f.endswith('.png')]
+        for idx, file_name in enumerate(sorted(saved_files), 1):
+            print(f"  [{idx}] {file_name}")
+    print("="*55 + "\n")
 
 if __name__ == "__main__":
     main()

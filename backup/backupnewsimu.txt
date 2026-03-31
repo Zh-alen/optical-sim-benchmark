@@ -1,0 +1,197 @@
+import os
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import scipy.signal as sp_signal
+import numpy as np
+
+# =========================================================================
+# 【核心修改点 1】：导入新版 Commplax 的模块
+# =========================================================================
+from commplax import adaptive_kernel as ak
+from commplax.equalizer import MIMOCell
+from commplax import sym_map
+
+# =========================================================================
+# 路径配置
+# =========================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FIGURE_PATH = os.path.join(BASE_DIR, 'results', 'figure')
+
+if not os.path.exists(FIGURE_PATH):
+    os.makedirs(FIGURE_PATH)
+    print(f"Created directory: {FIGURE_PATH}")
+
+# =========================================================================
+# 核心评价与自动扶正函数
+# =========================================================================
+
+def get_snr(ref, rec):
+    """带有自动精细相位对齐的 SNR 计算函数"""
+    rec = rec / (jnp.sqrt(jnp.mean(jnp.abs(rec)**2)) + 1e-12)
+    ref = ref / (jnp.sqrt(jnp.mean(jnp.abs(ref)**2)) + 1e-12)
+    
+    best_snr = -100.0
+    best_rec = rec
+    
+    for angle in [0, jnp.pi/2, jnp.pi, 3*jnp.pi/2]:
+        temp_rec = rec * jnp.exp(-1j * angle)
+        phase_offset = jnp.angle(jnp.mean(temp_rec * jnp.conj(ref)))
+        temp_rec_final = temp_rec * jnp.exp(-1j * phase_offset)
+        
+        mse = jnp.mean(jnp.abs(ref - temp_rec_final)**2)
+        snr = 10 * jnp.log10(1.0 / (mse + 1e-12))
+        
+        if snr > best_snr:
+            best_snr = snr
+            best_rec = temp_rec_final
+            
+    return best_snr, best_rec
+
+# =========================================================================
+# 绘图工具函数
+# =========================================================================
+
+def plot_psd(sig, fs, name='Signal PSD', filename='psd_analysis.png'):
+    plt.figure(figsize=(10, 5))
+    for i in range(sig.shape[1]):
+        f, Pxx_den = sp_signal.welch(np.array(sig[:, i]), fs, nperseg=1024)
+        plt.semilogy(f / 1e9, Pxx_den, label=f'Pol {i}')
+    plt.title(name)
+    plt.xlabel('Frequency (GHz)')
+    plt.ylabel('PSD (V**2/Hz)')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
+    print(f"   Saved: {filename}")
+    plt.close()
+
+def plot_eye(sig, sps=2, name='Eye Diagram', amplitude_limit=1.5, filename='eye_diagram.png'):
+    plt.figure(figsize=(12, 5))
+    num_points = int(2 * sps) + 1 
+    num_traces = 800
+    
+    for i in range(2):
+        ax = plt.subplot(1, 2, i+1)
+        start = 10000 if sig.shape[0] > 10000 else 0
+        data = np.array(sig[start:, i].real)
+        
+        traces = []
+        for j in range(0, min(len(data) - num_points, num_traces * sps), sps):
+            trace = data[j : j + num_points]
+            traces.append(trace)
+        
+        if len(traces) > 0:
+            traces = np.array(traces)
+            t = np.linspace(0, 2, num_points)
+            for trace in traces:
+                ax.plot(t, trace, 'b-', alpha=0.05, linewidth=0.5)
+            
+            ax.axvline(x=1.0, color='r', linestyle='--', alpha=0.3, linewidth=1)
+
+        ax.set_xlim([0, 2])
+        ax.set_ylim([-amplitude_limit, amplitude_limit])
+        ax.set_title(f'{name} - Pol {i}')
+        ax.set_xlabel('Time (Symbol Period)')
+        ax.set_ylabel('Amplitude')
+        ax.grid(True, linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURE_PATH, filename), dpi=300)
+    print(f"   Saved: {filename}")
+    plt.close()
+
+# =========================================================================
+# 主仿真逻辑
+# =========================================================================
+
+def main():
+    # 1. Tx: 16QAM 生成
+    print("Step 1: Signal Generation...")
+    num_syms = 32768
+    const = jnp.asarray(sym_map.const('16QAM', norm=True))
+    key = jax.random.PRNGKey(42)
+    tx_indices = jax.random.randint(key, (num_syms, 2), 0, 16)
+    tx_syms = const[tx_indices]
+
+    # 2. Channel: 2 SPS 并加噪
+    print("Step 2: Channel Impairments...")
+    rx_2sps = jnp.zeros((num_syms * 2, 2), dtype=tx_syms.dtype)
+    rx_2sps = rx_2sps.at[::2, :].set(tx_syms) 
+    noise = (jax.random.normal(jax.random.PRNGKey(123), rx_2sps.shape) + 
+             1j * jax.random.normal(jax.random.PRNGKey(124), rx_2sps.shape)) * 0.03
+    rx_2sps += noise
+
+    print("Plotting Before DSP status...")
+    plot_psd(rx_2sps, fs=64e9, name='PSD Before DSP', filename='01_psd_before_dsp.png')
+    plot_eye(rx_2sps, sps=2, name='Eye Before DSP', filename='02_eye_before_dsp.png')
+
+    # =========================================================================
+    # 【核心修改点 2】：使用最新版的 MIMOCell 架构
+    # =========================================================================
+    print("Step 3: Commplax Rx DSP (MIMOCell Architecture)...")
+    taps = 41
+    
+    # 初始化 CMA 算法内核
+    kernel = ak.cma(lr=1e-4, R2=1.32)
+    
+    # 实例化 MIMOCell：
+    # 告知它处理双偏振 (dims=2)，多相抽取策略为输入 2 输出 1 (up=1, down=2)
+    cma_eq = MIMOCell(num_taps=taps, dims=2, kernel=kernel, up=1, down=2)
+
+    # MIMOCell 作为一个对象，可以直接调用。我们把它包装成 scan 需要的单步函数
+    def scan_step(eq_state, x):
+        return eq_state(x)
+
+    print("   Training & Applying CMA...")
+    # lax.scan 会自动沿着时间轴把 rx_2sps 里的点一个一个送入 MIMOCell
+    # 不再需要外部组帧，MIMOCell 自带的 SyncFIFO 会自动处理滑动窗口
+    _, rx_eq_2sps_out = jax.lax.scan(scan_step, cma_eq, rx_2sps)
+
+    # 4. Evaluation
+    print("Step 4: Performance Evaluation...")
+    
+    # 【核心抽取逻辑】：
+    # 因为我们设置了 down=2，MIMOCell 内部逢 2 才会产生一次有效计算
+    # 其他时刻它会输出 0。因此我们只需要把偶数位的有效输出抽取出来即可 (回到 1 SPS)
+    rx_eq = rx_eq_2sps_out[::2]
+    
+    # 兼容性处理：如果有多余维度则去除
+    if rx_eq.ndim == 3: 
+        rx_eq = jnp.squeeze(rx_eq, axis=1)
+
+    # 丢弃前三分之一的数据作为均衡器收敛期
+    start_idx = num_syms // 3
+    rx_final = rx_eq[start_idx:]
+    tx_final = tx_syms[start_idx:start_idx + rx_final.shape[0]]
+
+    aligned_list = []
+    for i in range(2):
+        snr_v, aligned_sig = get_snr(tx_final[:, i], rx_final[:, i])
+        print(f"   Pol {i} SNR: {snr_v:.2f} dB")
+        aligned_list.append(aligned_sig)
+    
+    rx_aligned_all = jnp.stack(aligned_list, axis=1)
+
+    # --- 绘图：DSP 后 ---
+    plt.figure(figsize=(10, 5))
+    for i in range(2):
+        ax = plt.subplot(1, 2, i+1)
+        plt.scatter(rx_aligned_all[-3000:, i].real, rx_aligned_all[-3000:, i].imag, s=1, alpha=0.5)
+        plt.title(f'Constellation Pol {i}\nSNR: {float(snr_v):.2f} dB')
+        plt.axis('equal')
+        plt.scatter(const.real, const.imag, c='red', marker='x', s=20, alpha=0.7)
+        
+    plt.savefig(os.path.join(FIGURE_PATH, '03_constellations.png'), dpi=300)
+    print("   Saved: 03_constellations.png")
+    plt.close()
+
+    plot_psd(rx_aligned_all, fs=32e9, name='PSD After DSP', filename='04_psd_after_dsp.png')
+    plot_eye(rx_aligned_all, sps=1, name='Eye After DSP', amplitude_limit=1.5, filename='05_eye_after_dsp.png')
+
+    print(f"\nAll plots are saved in: {FIGURE_PATH}")
+    plt.show()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commplax"
+version = "0.2.0"
+description = "Differentiable DSP library for optical communication"
+authors = [
+    { name = "Commplax team", email = "remi.qr.fan@gmail.com" }
+]
+license = { text = "Apache-2.0" }
+dependencies = [
+    "jax",
+    "jaxlib",
+    "equinox",
+    "scipy",
+]
+
+[project.optional-dependencies]
+plot = [
+    "seaborn",
+    "plotly",
+    "mpl-scatter-density"
+]
+cuda12 = [
+    "jax[cuda12]"
+]
+dev = [
+    "attr",
+    "mock",
+    "pytest",
+    "pytest-cov",
+    "parameterized",
+    "ipykernel",
+    "ipympl",
+    "tqdm",
+    "ruff"
+]
+docs = [
+    "mkdocs-material",
+    "marimo"
+]
+
+[tool.setuptools.packages.find]
+include = ["commplax*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "single"
